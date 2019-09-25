@@ -382,3 +382,58 @@ module ``Getting record with custom prefix and record type`` =
   let ``return record with corresponding value`` () =
     setEnvVar ("magic-number", "42")
     test <@ EnvConfig.Get<Config> () = Ok ({MagicNumber = 42}) @>
+
+
+ module ``Logging reading operations`` =
+   open Common
+   
+   let createTestLogger () = 
+     let output = Text.StringBuilder()
+     (   output, 
+         ((output.Append : string -> _) >> ignore),
+         (fun testValue -> output.ToString().IndexOf(testValue, StringComparison.CurrentCultureIgnoreCase) >= 0)
+     )
+   
+   [<Test>]
+   let ``logging prefix `` () =
+     let output, logger, isLogged = createTestLogger()
+     test 
+         <@ 
+             EnvConfig.Get<CustomPrefixSampleConfig> (logger) |> ignore
+             isLogged "prefix" &&
+             isLogged "myapp"
+         @>
+   
+   [<Test>]
+   let ``logging separator`` () =
+     let output, logger, isLogged = createTestLogger()
+     test 
+         <@ 
+             EnvConfig.Get<CustomSeparatorSampleConfig> (logger) |> ignore
+             isLogged "separator" &&
+             isLogged "\"-\""
+         @>
+   
+   [<Test>]
+   let ``logging prefix and separator`` () =
+     let output, logger, isLogged = createTestLogger()
+     test 
+         <@ 
+             EnvConfig.Get<CustomPrefixAndSeparatorSampleConfig> (logger) |> ignore
+             isLogged "prefix" &&
+             isLogged "myapp" &&
+             isLogged "separator" &&
+             isLogged "\"__\""
+         @>
+
+         
+   [<Test>]
+   let ``logging variable names`` () =
+       let output, logger, isLogged = createTestLogger()
+       test 
+           <@ 
+               EnvConfig.Get<SampleConfig> (logger) |> ignore
+               isLogged "process_id"
+           @>
+
+
