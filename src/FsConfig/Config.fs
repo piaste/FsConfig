@@ -37,6 +37,10 @@ type ConventionAttribute(prefix : string) =
   member val Prefix = prefix with get,set
   member val Separator = "" with get, set
 
+[<AttributeUsage(AttributeTargets.Class ||| AttributeTargets.Property, AllowMultiple = false)>]
+type CultureInfoAttribute(name: string) =
+  inherit Attribute ()
+  member val Name = name with get,set
 
 
 type IConfigReader =
@@ -46,6 +50,8 @@ type IConfigReader =
 module internal Core =
 
   open TypeShape.Core
+  open System.Globalization
+
 
   let notSupported name =
     sprintf """The target type of "%s" is currently not supported""" name
@@ -54,6 +60,13 @@ module internal Core =
   let defaultSplitCharacter = SplitCharacter ','
 
   type TryParse<'a> = string -> 'a option
+  
+  type FieldValueParseArgs = {
+    Name : string
+    ListSplitChar : SplitCharacter
+    DefaultValue : string option
+    CultureInfo : CultureInfo option
+  }
 
   let getPrefixAndSeparator<'T> defaultPrefix defaultSeparator =
     let conventionAttribute =
@@ -96,6 +109,38 @@ module internal Core =
     match tryParseFunc value with
     | true, v -> Some v
     | _ -> None
+
+  let tryParseDateTime args value = 
+    match args.CultureInfo with
+    | Some culture -> tryParse (fun d -> DateTime.TryParse(value, culture, DateTimeStyles.None))
+    | None -> tryParse DateTime.TryParse
+
+  let inline tryParseNumber< ^number 
+                              when ^number : (static member TryParse: string * byref< ^number> -> bool)  
+                              and ^number : (static member TryParse: string * NumberStyles * IFormatProvider * byref< ^number> -> bool)  
+                           >
+            args 
+            value = 
+
+    let mutable result = Unchecked.defaultof< ^number >
+    
+    match args.CultureInfo with
+    | Some culture ->
+        // culture specified, culture-sensitive parsing
+        let success = 
+            (^number : (static member TryParse: string * NumberStyles * IFormatProvider * byref< ^number> -> bool)
+                (value, NumberStyles.Any, culture, &result)
+            ) 
+        if success then Some result else None
+
+    | None ->
+        // culture unspecified
+        let success = 
+            (^number : (static member TryParse: string * byref< ^number> -> bool)
+                (value, &result)
+            ) 
+        if success then Some result else None
+
   
   let tryParseFSharpDU (shape : ShapeFSharpUnion<'T>) value =
     shape.UnionCases 
@@ -115,21 +160,21 @@ module internal Core =
           tryParse System.Enum.TryParse<'Enum> value |> wrap
     }
 
-  let getTryParseFunc<'T> targetTypeShape =
+  let getTryParseFunc<'T> (args : FieldValueParseArgs) targetTypeShape =
     let wrap(p : 'a) = 
       Some (unbox<TryParse<'T>> p) 
     match targetTypeShape with
-    | Shape.Byte -> wrap (tryParse Byte.TryParse) 
-    | Shape.SByte -> wrap (tryParse SByte.TryParse)
-    | Shape.Int16 -> wrap (tryParse Int16.TryParse)
-    | Shape.Int32 -> wrap (tryParse Int32.TryParse)
-    | Shape.Int64 -> wrap (tryParse Int64.TryParse)
-    | Shape.UInt16 -> wrap (tryParse UInt16.TryParse) 
-    | Shape.UInt32 -> wrap (tryParse UInt32.TryParse) 
-    | Shape.UInt64 -> wrap (tryParse UInt64.TryParse) 
-    | Shape.Single -> wrap (tryParse Single.TryParse) 
-    | Shape.Double -> wrap (tryParse Double.TryParse) 
-    | Shape.Decimal -> wrap (tryParse Decimal.TryParse) 
+    | Shape.Byte -> wrap (tryParseNumber<Byte> args) 
+    | Shape.SByte -> wrap (tryParseNumber<SByte> args)
+    | Shape.Int16 -> wrap (tryParseNumber<Int16> args)
+    | Shape.Int32 -> wrap (tryParseNumber<Int32> args)
+    | Shape.Int64 -> wrap (tryParseNumber<Int64> args)
+    | Shape.UInt16 -> wrap (tryParseNumber<UInt16> args) 
+    | Shape.UInt32 -> wrap (tryParseNumber<UInt32> args) 
+    | Shape.UInt64 -> wrap (tryParseNumber<UInt64> args) 
+    | Shape.Single -> wrap (tryParseNumber<Single> args) 
+    | Shape.Double -> wrap (tryParseNumber<Double> args) 
+    | Shape.Decimal -> wrap (tryParseNumber<Decimal> args) 
     | Shape.Char -> wrap (tryParse Char.TryParse)
     | Shape.String -> wrap (tryParse (fun (s : string) -> (true,s)))
     | Shape.Bool -> wrap (tryParse Boolean.TryParse)
@@ -144,7 +189,7 @@ module internal Core =
       wrap (tryParseFSharpDU shape)
     | _ -> None
 
-  let parseFSharpOption<'T> name value (fsharpOption : IShapeFSharpOption) =
+  let parseFSharpOption<'T> args value (fsharpOption : IShapeFSharpOption) =
     let wrap (p : ConfigParseResult<'a>) =
       unbox<ConfigParseResult<'T>> p
     fsharpOption.Element.Accept {
@@ -155,7 +200,7 @@ module internal Core =
             let result : ConfigParseResult<'t option> = None |> Ok 
             wrap result
           | Some v ->
-            match getTryParseFunc<'t> fsharpOption.Element with
+            match getTryParseFunc<'t> args fsharpOption.Element with
             | Some tryParseFunc ->
               match shapeof<'t> with
               | Shape.String -> 
@@ -163,12 +208,12 @@ module internal Core =
                   let result : ConfigParseResult<'t option> = None |> Ok 
                   wrap result
                 else
-                  tryParseWith name v tryParseFunc 
+                  tryParseWith args.Name v tryParseFunc 
                   |> Result.bind (Some >> Ok >> wrap) 
               | _ ->
-                tryParseWith name v tryParseFunc 
+                tryParseWith args.Name v tryParseFunc 
                 |> Result.bind (Some >> Ok >> wrap) 
-            | None -> notSupported name |> Error 
+            | None -> notSupported args.Name |> Error 
     }
 
   let parseListReducer name tryParseFunc acc element = 
@@ -179,7 +224,7 @@ module internal Core =
           |> Result.map (fun v -> v :: xs)
         )
 
-  let parseFSharpList<'T> name value (fsharpList: IShapeFSharpList) (SplitCharacter splitCharacter) =
+  let parseFSharpList<'T> args value (fsharpList: IShapeFSharpList) (SplitCharacter splitCharacter) =
     let wrap (p : ConfigParseResult<'a>) =
       unbox<ConfigParseResult<'T>> p
     fsharpList.Element.Accept {
@@ -190,21 +235,16 @@ module internal Core =
             let result : ConfigParseResult<'t list> = [] |> Ok 
             wrap result
           | Some (v : string) -> 
-            match getTryParseFunc<'t> fsharpList.Element with
+            match getTryParseFunc<'t> args fsharpList.Element with
             | Some tryParseFunc -> 
               v.Split(splitCharacter) 
               |> Array.map (fun s -> s.Trim())
               |> Array.filter (String.IsNullOrWhiteSpace >> not)
-              |> Array.fold (parseListReducer name tryParseFunc) (Ok [])
+              |> Array.fold (parseListReducer args.Name tryParseFunc) (Ok [])
               |> Result.bind (List.rev >> Ok >> wrap)
-            | None -> notSupported name |> Error 
+            | None -> notSupported args.Name |> Error 
     }
 
-  type FieldValueParseArgs = {
-    Name : string
-    ListSplitChar : SplitCharacter
-    DefaultValue : string option
-  }
   
   let rec parseInternal<'T> (configReader : IConfigReader) (fieldNameCanonicalizer : FieldNameCanonicalizer) args =
     let value = 
@@ -216,11 +256,11 @@ module internal Core =
     | Shape.FSharpRecord (:? ShapeFSharpRecord<'T> as shape) ->
       parseFSharpRecord configReader fieldNameCanonicalizer (Prefix args.Name) shape
     | Shape.FSharpOption fsharpOption -> 
-      parseFSharpOption<'T> args.Name value fsharpOption
+      parseFSharpOption<'T> args value fsharpOption
     | Shape.FSharpList fsharpList ->
-      parseFSharpList<'T> args.Name value fsharpList args.ListSplitChar
+      parseFSharpList<'T> args value fsharpList args.ListSplitChar
     | _ ->
-      match getTryParseFunc<'T> targetTypeShape with
+      match getTryParseFunc<'T> args targetTypeShape with
       | Some tryParseFunc -> 
         match value with
         | Some v -> tryParseWith args.Name v tryParseFunc
@@ -256,11 +296,28 @@ module internal Core =
             |> Seq.tryHead
             |> Option.map (fun a -> a :?> DefaultValueAttribute)
             |> Option.map (fun attr -> attr.Value)
+            
+          let cultureInfoAttribute =
+            
+            let recordCultureInfo = 
+                record.GetType().GetCustomAttributes(typeof<CultureInfoAttribute>, true)
+                |> Seq.tryHead
+           
+            let fieldCultureInfo = 
+                field.MemberInfo.GetCustomAttributes(typeof<CultureInfoAttribute>, true)
+                |> Seq.tryHead
+
+            fieldCultureInfo
+            |> Option.orElse recordCultureInfo
+            |> Option.map (fun a -> a :?> CultureInfoAttribute)
+            |> Option.map (fun attr -> CultureInfo(attr.Name))
+
 
           let args = {
             Name = configName
             ListSplitChar = splitCharacter
             DefaultValue = defaultValueAttribute
+            CultureInfo = cultureInfoAttribute
           }
 
           field.Accept {
@@ -282,5 +339,6 @@ module Config =
       Name = name
       ListSplitChar = defaultSplitCharacter
       DefaultValue = None
+      CultureInfo = None
     }
     parseInternal<'T> (configReader : IConfigReader) (fieldNameCanonicalizer : FieldNameCanonicalizer) args
